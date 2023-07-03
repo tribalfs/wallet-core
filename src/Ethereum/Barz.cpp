@@ -11,34 +11,25 @@
 #include "HexCoding.h"
 #include <WebAuthn.h>
 #include "../proto/Barz.pb.h"
+#include "AsnParser.h"
+#include "Base64.h"
 
 namespace TW::Barz {
 
-using ParamBasePtr = std::shared_ptr<TW::Ethereum::ABI::ParamBase>;
+using ParamBasePtr = std::shared_ptr<Ethereum::ABI::ParamBase>;
 using ParamCollection = std::vector<ParamBasePtr>;
 
-std::string getCounterfactualAddress(const TW::Barz::Proto::ContractAddressInput input) {
-    auto params = TW::Ethereum::ABI::ParamTuple();
-    params.addParam(std::make_shared<TW::Ethereum::ABI::ParamAddress>(parse_hex(input.diamond_cut_facet())));
-    params.addParam(std::make_shared<TW::Ethereum::ABI::ParamAddress>(parse_hex(input.account_facet())));
-    params.addParam(std::make_shared<TW::Ethereum::ABI::ParamAddress>(parse_hex(input.verification_facet())));
-    params.addParam(std::make_shared<TW::Ethereum::ABI::ParamAddress>(parse_hex(input.entry_point())));
-    params.addParam(std::make_shared<TW::Ethereum::ABI::ParamAddress>(parse_hex(input.security_manager())));
-    params.addParam(std::make_shared<TW::Ethereum::ABI::ParamAddress>(parse_hex(input.facet_registry())));
-
-    Data publicKey;
-    switch (input.owner().kind_case()) {
-    case TW::Barz::Proto::ContractOwner::KindCase::KIND_NOT_SET:
-        return "";
-    case TW::Barz::Proto::ContractOwner::KindCase::kPublicKey:
-        publicKey = parse_hex(input.owner().public_key());
-        break;
-    case TW::Barz::Proto::ContractOwner::KindCase::kAttestationObject:
-        const auto attestationObject = parse_hex(input.owner().attestation_object());
-        publicKey = subData(TW::WebAuthn::getPublicKey(attestationObject)->bytes, 1); // Drop the first byte which corresponds to the public key type
-        break;
-    }
-    params.addParam(std::make_shared<TW::Ethereum::ABI::ParamByteArray>(publicKey));
+std::string getCounterfactualAddress(const Proto::ContractAddressInput input) {
+    auto params = Ethereum::ABI::ParamTuple();
+    params.addParam(std::make_shared<Ethereum::ABI::ParamAddress>(parse_hex(input.diamond_cut_facet())));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamAddress>(parse_hex(input.account_facet())));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamAddress>(parse_hex(input.verification_facet())));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamAddress>(parse_hex(input.token_receiver_facet())));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamAddress>(parse_hex(input.diamond_loupe_facet())));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamAddress>(parse_hex(input.entry_point())));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamAddress>(parse_hex(input.diamond_init())));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamAddress>(parse_hex(input.facet_registry())));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamByteArray>(parse_hex(input.public_key())));
 
     Data encoded;
     params.encode(encoded);
@@ -48,7 +39,54 @@ std::string getCounterfactualAddress(const TW::Barz::Proto::ContractAddressInput
 
     const Data initCodeHash = Hash::keccak256(initCode);
     const Data salt(32, 0);
-    return Ethereum::checksumed(TW::Ethereum::Address(hexEncoded(TW::Ethereum::create2Address(input.factory(), salt, initCodeHash))));
+    return Ethereum::checksumed(Ethereum::Address(hexEncoded(Ethereum::create2Address(input.factory(), salt, initCodeHash))));
+}
+
+Data getInitCode(const std::string& factoryAddress, const PublicKey& publicKey, const std::string& verificationFacet) {
+    auto createAccountFunc = Ethereum::ABI::Function("createAccount", ParamCollection{
+                                                                std::make_shared<Ethereum::ABI::ParamAddress>(parse_hex(verificationFacet)),
+                                                                std::make_shared<Ethereum::ABI::ParamByteArray>(publicKey.bytes),
+                                                                std::make_shared<Ethereum::ABI::ParamUInt256>(0)});
+    Data createAccountFuncEncoded;
+    createAccountFunc.encode(createAccountFuncEncoded);
+
+    Data envelope;
+    append(envelope, parse_hex(factoryAddress));
+    append(envelope, createAccountFuncEncoded);
+    return envelope;
+}
+
+Data getFormattedSignature(const Data& signature, const Data challenge, const Data& authenticatorData, const std::string& clientDataJSON) {
+    std::string challengeBase64 = TW::Base64::encodeBase64Url(challenge);
+    while (challengeBase64.back() == '=') {
+        challengeBase64.pop_back();
+    }
+    size_t challengePos = clientDataJSON.find(challengeBase64);
+    if (challengePos == std::string::npos) {
+        return Data();
+    }
+
+    const std::string clientDataJSONPre = clientDataJSON.substr(0, challengePos);
+    const std::string clientDataJSONPost = clientDataJSON.substr(challengePos + challengeBase64.size());
+
+    const auto parsedSignatureOptional = ASN::AsnParser::ecdsa_signature_from_der(signature);
+    if (!parsedSignatureOptional.has_value()) {
+        return Data();
+    }
+    const Data parsedSignature = parsedSignatureOptional.value();
+    const Data rValue = subData(parsedSignature, 0, 32);
+    const Data sValue = subData(parsedSignature, 32, 64);
+
+    auto params = Ethereum::ABI::ParamTuple();
+    params.addParam(std::make_shared<Ethereum::ABI::ParamUInt256>(uint256_t(hexEncoded(rValue))));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamUInt256>(uint256_t(hexEncoded(sValue))));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamByteArray>(authenticatorData));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamString>(clientDataJSONPre));
+    params.addParam(std::make_shared<Ethereum::ABI::ParamString>(clientDataJSONPost));
+
+    Data encoded;
+    params.encode(encoded);
+    return encoded;
 }
 
 } // namespace TW::Barz
